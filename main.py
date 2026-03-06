@@ -10,14 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
 from classifier.scripts.infer import detect_bubbles
-
 from pipeline.extract_text_and_order import extract_text_and_order
 from pipeline.ocr_ensemble import OCREnsemble
 from pipeline.rec_only import load_rec_model
 from pipeline.convo_preprocess import turns_to_llm_convo, Turn as LlmTurn
-
 from llm.openai_engine import OpenAIEngine
-
 from dotenv import load_dotenv
 
 # =========================================================
@@ -33,71 +30,78 @@ app = FastAPI()
 # =========================================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 개발 편의. 배포 시 도메인 제한 추천
+    allow_origins=["*"],  # 배포 후엔 도메인 제한 추천
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =========================================================
-# 2) 전역 로드 (요청마다 만들면 느림)
-#    ✅ "생성"만 여기서 하고
-#    ✅ "실제 첫 추론(warmup)"은 /warmup에서 하자
+# 2) 전역 객체 (처음엔 비워둠)
+#    ✅ import 시점엔 무거운 로딩 금지
 # =========================================================
-
-# --- EasyOCR 앙상블(옵션) ---
 ocr_ensemble: Optional[OCREnsemble] = None
-try:
-    ocr_ensemble = OCREnsemble(
-        enable_easyocr=True,
-        easyocr_gpu=False,        # 맥이면 보통 False
-        easyocr_langs=["ko", "en"],
-        easyocr_debug=False,      # 필요할 때만 True
-    )
-    print("✅ OCR Ensemble ready (easyocr optional)")
-except Exception as e:
-    print("❌ OCR Ensemble init failed:", repr(e))
-    ocr_ensemble = None
-
-# --- Rec-only 모델(초고속 1차 인식) ---
 rec_model = None
-try:
-    rec_model = load_rec_model()
-    print("✅ Rec-only model loaded")
-except Exception as e:
-    print("❌ Rec-only model load failed:", repr(e))
-    rec_model = None
-
-# --- OpenAI 엔진 ---
 openai_engine: Optional[OpenAIEngine] = None
-try:
-    openai_engine = OpenAIEngine()  # OPENAI_API_KEY 필요
-    print("✅ OpenAI engine loaded")
-except Exception as e:
-    print("❌ OpenAI engine init failed:", repr(e))
-    openai_engine = None
 
 
 # =========================================================
-# 3) warmup 함수들
+# 3) 지연 로딩 함수
+# =========================================================
+def ensure_openai_engine():
+    global openai_engine
+    if openai_engine is None:
+        try:
+            openai_engine = OpenAIEngine()
+            print("✅ OpenAI engine loaded")
+        except Exception as e:
+            print("❌ OpenAI engine init failed:", repr(e))
+            openai_engine = None
+    return openai_engine
+
+
+def ensure_ocr_ensemble():
+    global ocr_ensemble
+    if ocr_ensemble is None:
+        try:
+            ocr_ensemble = OCREnsemble(
+                enable_easyocr=True,
+                easyocr_gpu=False,
+                easyocr_langs=["ko", "en"],
+                easyocr_debug=False,
+            )
+            print("✅ OCR Ensemble ready (easyocr optional)")
+        except Exception as e:
+            print("❌ OCR Ensemble init failed:", repr(e))
+            ocr_ensemble = None
+    return ocr_ensemble
+
+
+def ensure_rec_model():
+    global rec_model
+    if rec_model is None:
+        try:
+            rec_model = load_rec_model()
+            print("✅ Rec-only model loaded")
+        except Exception as e:
+            print("❌ Rec-only model load failed:", repr(e))
+            rec_model = None
+    return rec_model
+
+
+# =========================================================
+# 4) warmup 함수들
 # =========================================================
 def warmup_easyocr(ensemble: Optional[OCREnsemble]) -> None:
-    """
-    ✅ EasyOCR는 첫 호출이 느릴 수 있어서 더미 1회로 워밍업
-    """
     if ensemble is None or getattr(ensemble, "easy", None) is None:
         return
-    import numpy as np
 
+    import numpy as np
     dummy = Image.fromarray(np.zeros((64, 256, 3), dtype=np.uint8))
     _ = ensemble.easy.extract_lines(dummy)
 
 
 def warmup_yolo_once() -> None:
-    """
-    ✅ detect_bubbles 내부에서 YOLO 모델/세션 로드가 일어난다면
-    더미 이미지로 1회 호출해서 선불 처리
-    """
     dummy = Image.new("RGB", (640, 640), (255, 255, 255))
 
     tmp_path = None
@@ -116,83 +120,105 @@ def warmup_yolo_once() -> None:
 
 
 # =========================================================
-# ✅ 4) HEALTH (가벼워야 함)
+# 5) HEALTH
 # =========================================================
 @app.get("/health")
 def health():
     """
-    ✅ 서버 생존 + 전역 객체 생성 여부만 확인
-    (여기서 절대 무거운 warmup/추론 하지 말기)
+    ✅ 절대 무거운 로딩 안 함
     """
     return {
         "ok": True,
-        "openai_engine": openai_engine is not None,
-        "rec_model": rec_model is not None,
-        "ocr_ensemble": ocr_ensemble is not None,
+        "openai_engine_ready": openai_engine is not None,
+        "rec_model_ready": rec_model is not None,
+        "ocr_ensemble_ready": ocr_ensemble is not None,
         "time": time.time(),
     }
 
 
 # =========================================================
-# ✅ 5) WARMUP (앱 시작 시 1회 호출 추천)
+# 6) WARMUP
 # =========================================================
 @app.post("/warmup")
 def warmup():
     """
-    ✅ 앱 시작 시 호출해서 '첫 요청 느려짐'을 선불로 처리
-    - YOLO 1회
-    - EasyOCR 1회
-    - OpenAI는 비용 때문에 호출하지 않음(엔진 존재 체크만)
+    ✅ 앱 시작 시 1회 호출 추천
+    - 여기서 무거운 모델들을 실제 로드
     """
     timings: Dict[str, float] = {}
     t0 = time.perf_counter()
 
-    # (A) YOLO warmup
+    # (A) OpenAI 엔진 준비
+    t1 = time.perf_counter()
+    ensure_openai_engine()
+    timings["openai_engine_init_ms"] = round((time.perf_counter() - t1) * 1000, 1)
+
+    # (B) OCR ensemble 준비
+    t2 = time.perf_counter()
+    ensemble = ensure_ocr_ensemble()
+    timings["ocr_ensemble_init_ms"] = round((time.perf_counter() - t2) * 1000, 1)
+
+    # (C) Rec model 준비
+    t3 = time.perf_counter()
+    rm = ensure_rec_model()
+    timings["rec_model_init_ms"] = round((time.perf_counter() - t3) * 1000, 1)
+
+    # (D) YOLO warmup
     try:
-        t1 = time.perf_counter()
+        t4 = time.perf_counter()
         warmup_yolo_once()
-        timings["warmup_yolo_ms"] = round((time.perf_counter() - t1) * 1000, 1)
+        timings["warmup_yolo_ms"] = round((time.perf_counter() - t4) * 1000, 1)
     except Exception as e:
         timings["warmup_yolo_error"] = repr(e)
 
-    # (B) OCR warmup
+    # (E) OCR warmup
     try:
-        t2 = time.perf_counter()
-        warmup_easyocr(ocr_ensemble)
-        timings["warmup_ocr_ms"] = round((time.perf_counter() - t2) * 1000, 1)
+        t5 = time.perf_counter()
+        warmup_easyocr(ensemble)
+        timings["warmup_ocr_ms"] = round((time.perf_counter() - t5) * 1000, 1)
     except Exception as e:
         timings["warmup_ocr_error"] = repr(e)
 
-    # (C) OpenAI 체크(비용 방지)
     timings["openai_engine_ready"] = 1.0 if openai_engine is not None else 0.0
+    timings["rec_model_ready"] = 1.0 if rm is not None else 0.0
+    timings["ocr_ensemble_ready"] = 1.0 if ensemble is not None else 0.0
     timings["total_warmup_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
     return {
         "ok": True,
         "timings": timings,
-        "note": "Warmup done. YOLO+OCR initialized. OpenAI not called to avoid cost.",
+        "note": "Warmup done. Models initialized lazily after server boot.",
     }
 
 
 # =========================================================
-# ✅ 6) ANALYZE
+# 7) ANALYZE
 # =========================================================
 @app.post("/analyze-image")
 async def analyze_image(
     device_id: str = Form(...),
     image: UploadFile = File(...),
 ):
-    # ✅ OpenAI가 없으면 바로 에러
-    if openai_engine is None:
+    # ✅ 첫 요청에서도 자동 준비
+    engine = ensure_openai_engine()
+    ensemble = ensure_ocr_ensemble()
+    rm = ensure_rec_model()
+
+    if engine is None:
         raise HTTPException(
             status_code=500,
             detail="OpenAI engine not available. Check OPENAI_API_KEY and llm/openai_engine.py.",
         )
 
+    if rm is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Rec model not available.",
+        )
+
     timings: Dict[str, float] = {}
     t0 = time.perf_counter()
 
-    # (A) 업로드 파일 저장
     suffix = Path(image.filename).suffix.lower() if image.filename else ".jpg"
     if suffix not in [".jpg", ".jpeg", ".png", ".webp"]:
         suffix = ".jpg"
@@ -205,7 +231,7 @@ async def analyze_image(
     timings["save_image_ms"] = round((t1 - t0) * 1000, 1)
 
     try:
-        # (B) YOLO 말풍선 검출
+        # (B) YOLO 검출
         dets = detect_bubbles(image=tmp_path, conf=0.25)
         t2 = time.perf_counter()
         timings["yolo_detect_ms"] = round((t2 - t1) * 1000, 1)
@@ -220,9 +246,9 @@ async def analyze_image(
         turns, debug_lines = extract_text_and_order(
             image=pil_img,
             detections=dets,
-            ocr=None,                  # ✅ PaddleOCR 끔
-            ocr_ensemble=ocr_ensemble, # ✅ EasyOCR fallback
-            rec_model=rec_model,       # ✅ rec-only 모델
+            ocr=None,
+            ocr_ensemble=ensemble,
+            rec_model=rm,
             use_rec_first=True,
         )
         t4_1 = time.perf_counter()
@@ -230,13 +256,12 @@ async def analyze_image(
 
         # (E) LLM
         t5_0 = time.perf_counter()
-
         llm_turns = [LlmTurn(who=t.who, text=t.text) for t in turns]
-        convo = turns_to_llm_convo(llm_turns)  # ✅ m/o 축약 + 연속 동일 화자 압축
+        convo = turns_to_llm_convo(llm_turns)
 
         print(convo)
 
-        out = openai_engine.generate_reply(convo)
+        out = engine.generate_reply(convo)
         reply_text = (out.get("reply", "") if isinstance(out, dict) else "") or ""
 
         replies = {"reply": reply_text, "provider": "openai:gpt-4o-mini"}
