@@ -8,13 +8,6 @@ from typing import Dict, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
-
-from classifier.scripts.infer import detect_bubbles
-from pipeline.extract_text_and_order import extract_text_and_order
-from pipeline.ocr_ensemble import OCREnsemble
-from pipeline.rec_only import load_rec_model
-from pipeline.convo_preprocess import turns_to_llm_convo, Turn as LlmTurn
-from llm.openai_engine import OpenAIEngine
 from dotenv import load_dotenv
 
 # =========================================================
@@ -30,28 +23,59 @@ app = FastAPI()
 # =========================================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 배포 후엔 도메인 제한 추천
+    allow_origins=["*"],  # 배포 후에는 앱 도메인만 허용 추천
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =========================================================
-# 2) 전역 객체 (처음엔 비워둠)
-#    ✅ import 시점엔 무거운 로딩 금지
+# 2) 전역 캐시 (처음엔 None)
+#    ✅ 무거운 import / 모델 로드는 절대 top-level에서 하지 않음
 # =========================================================
-ocr_ensemble: Optional[OCREnsemble] = None
+detect_bubbles_fn = None
+extract_text_and_order_fn = None
+turns_to_llm_convo_fn = None
+LlmTurnCls = None
+
+ocr_ensemble = None
 rec_model = None
-openai_engine: Optional[OpenAIEngine] = None
+openai_engine = None
 
 
 # =========================================================
-# 3) 지연 로딩 함수
+# 3) 지연 import / 지연 로드 함수
 # =========================================================
+def get_detect_bubbles():
+    global detect_bubbles_fn
+    if detect_bubbles_fn is None:
+        from classifier.scripts.infer import detect_bubbles
+        detect_bubbles_fn = detect_bubbles
+    return detect_bubbles_fn
+
+
+def get_extract_text_and_order():
+    global extract_text_and_order_fn
+    if extract_text_and_order_fn is None:
+        from pipeline.extract_text_and_order import extract_text_and_order
+        extract_text_and_order_fn = extract_text_and_order
+    return extract_text_and_order_fn
+
+
+def get_convo_helpers():
+    global turns_to_llm_convo_fn, LlmTurnCls
+    if turns_to_llm_convo_fn is None or LlmTurnCls is None:
+        from pipeline.convo_preprocess import turns_to_llm_convo, Turn
+        turns_to_llm_convo_fn = turns_to_llm_convo
+        LlmTurnCls = Turn
+    return turns_to_llm_convo_fn, LlmTurnCls
+
+
 def ensure_openai_engine():
     global openai_engine
     if openai_engine is None:
         try:
+            from llm.openai_engine import OpenAIEngine
             openai_engine = OpenAIEngine()
             print("✅ OpenAI engine loaded")
         except Exception as e:
@@ -64,6 +88,7 @@ def ensure_ocr_ensemble():
     global ocr_ensemble
     if ocr_ensemble is None:
         try:
+            from pipeline.ocr_ensemble import OCREnsemble
             ocr_ensemble = OCREnsemble(
                 enable_easyocr=True,
                 easyocr_gpu=False,
@@ -81,6 +106,7 @@ def ensure_rec_model():
     global rec_model
     if rec_model is None:
         try:
+            from pipeline.rec_only import load_rec_model
             rec_model = load_rec_model()
             print("✅ Rec-only model loaded")
         except Exception as e:
@@ -90,9 +116,9 @@ def ensure_rec_model():
 
 
 # =========================================================
-# 4) warmup 함수들
+# 4) warmup 함수
 # =========================================================
-def warmup_easyocr(ensemble: Optional[OCREnsemble]) -> None:
+def warmup_easyocr(ensemble) -> None:
     if ensemble is None or getattr(ensemble, "easy", None) is None:
         return
 
@@ -102,6 +128,7 @@ def warmup_easyocr(ensemble: Optional[OCREnsemble]) -> None:
 
 
 def warmup_yolo_once() -> None:
+    detect_bubbles = get_detect_bubbles()
     dummy = Image.new("RGB", (640, 640), (255, 255, 255))
 
     tmp_path = None
@@ -120,13 +147,20 @@ def warmup_yolo_once() -> None:
 
 
 # =========================================================
-# 5) HEALTH
+# 5) 아주 가벼운 루트 엔드포인트
+#    ✅ 서버가 떴는지 바로 확인 가능
+# =========================================================
+@app.get("/")
+def root():
+    return {"ok": True, "service": "rizzgpt-backend"}
+
+
+# =========================================================
+# 6) HEALTH
+#    ✅ 무거운 로드 절대 금지
 # =========================================================
 @app.get("/health")
 def health():
-    """
-    ✅ 절대 무거운 로딩 안 함
-    """
     return {
         "ok": True,
         "openai_engine_ready": openai_engine is not None,
@@ -137,33 +171,30 @@ def health():
 
 
 # =========================================================
-# 6) WARMUP
+# 7) WARMUP
+#    ✅ 앱 시작 후 1회 호출 권장
 # =========================================================
 @app.post("/warmup")
 def warmup():
-    """
-    ✅ 앱 시작 시 1회 호출 추천
-    - 여기서 무거운 모델들을 실제 로드
-    """
     timings: Dict[str, float] = {}
     t0 = time.perf_counter()
 
-    # (A) OpenAI 엔진 준비
+    # OpenAI 엔진 준비
     t1 = time.perf_counter()
     ensure_openai_engine()
     timings["openai_engine_init_ms"] = round((time.perf_counter() - t1) * 1000, 1)
 
-    # (B) OCR ensemble 준비
+    # OCR ensemble 준비
     t2 = time.perf_counter()
     ensemble = ensure_ocr_ensemble()
     timings["ocr_ensemble_init_ms"] = round((time.perf_counter() - t2) * 1000, 1)
 
-    # (C) Rec model 준비
+    # rec model 준비
     t3 = time.perf_counter()
     rm = ensure_rec_model()
     timings["rec_model_init_ms"] = round((time.perf_counter() - t3) * 1000, 1)
 
-    # (D) YOLO warmup
+    # YOLO warmup
     try:
         t4 = time.perf_counter()
         warmup_yolo_once()
@@ -171,7 +202,7 @@ def warmup():
     except Exception as e:
         timings["warmup_yolo_error"] = repr(e)
 
-    # (E) OCR warmup
+    # EasyOCR warmup
     try:
         t5 = time.perf_counter()
         warmup_easyocr(ensemble)
@@ -192,7 +223,7 @@ def warmup():
 
 
 # =========================================================
-# 7) ANALYZE
+# 8) ANALYZE
 # =========================================================
 @app.post("/analyze-image")
 async def analyze_image(
@@ -207,7 +238,7 @@ async def analyze_image(
     if engine is None:
         raise HTTPException(
             status_code=500,
-            detail="OpenAI engine not available. Check OPENAI_API_KEY and llm/openai_engine.py.",
+            detail="OpenAI engine not available. Check OPENAI_API_KEY.",
         )
 
     if rm is None:
@@ -216,9 +247,14 @@ async def analyze_image(
             detail="Rec model not available.",
         )
 
+    detect_bubbles = get_detect_bubbles()
+    extract_text_and_order = get_extract_text_and_order()
+    turns_to_llm_convo, LlmTurn = get_convo_helpers()
+
     timings: Dict[str, float] = {}
     t0 = time.perf_counter()
 
+    # 업로드 파일 저장
     suffix = Path(image.filename).suffix.lower() if image.filename else ".jpg"
     if suffix not in [".jpg", ".jpeg", ".png", ".webp"]:
         suffix = ".jpg"
@@ -231,17 +267,17 @@ async def analyze_image(
     timings["save_image_ms"] = round((t1 - t0) * 1000, 1)
 
     try:
-        # (B) YOLO 검출
+        # YOLO 검출
         dets = detect_bubbles(image=tmp_path, conf=0.25)
         t2 = time.perf_counter()
         timings["yolo_detect_ms"] = round((t2 - t1) * 1000, 1)
 
-        # (C) 이미지 로드
+        # 이미지 로드
         pil_img = Image.open(tmp_path).convert("RGB")
         t3 = time.perf_counter()
         timings["load_image_ms"] = round((t3 - t2) * 1000, 1)
 
-        # (D) OCR + 순서 정렬
+        # OCR + 순서 정렬
         t4_0 = time.perf_counter()
         turns, debug_lines = extract_text_and_order(
             image=pil_img,
@@ -254,7 +290,7 @@ async def analyze_image(
         t4_1 = time.perf_counter()
         timings["ocr_ms"] = round((t4_1 - t4_0) * 1000, 1)
 
-        # (E) LLM
+        # LLM
         t5_0 = time.perf_counter()
         llm_turns = [LlmTurn(who=t.who, text=t.text) for t in turns]
         convo = turns_to_llm_convo(llm_turns)
