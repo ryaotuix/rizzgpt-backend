@@ -1,0 +1,15 @@
+# backend/classifier/data/yolo_manual/data_mix.yaml
+
+# (선택) 기준 경로. 있어도 되고 없어도 됨.
+path: backend/classifier/data/yolo_manual
+
+# ✅ mix_train을 학습용으로 쓰기
+train: images/mix_train
+
+# ✅ val은 그대로 유지
+val: images/val
+
+# ✅ 클래스 매핑
+names:
+  0: other
+  1: me

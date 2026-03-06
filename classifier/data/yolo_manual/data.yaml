@@ -1,0 +1,7 @@
+path: backend/classifier/data/yolo_manual
+train: images/train
+val: images/val
+
+names:
+  0: other
+  1: me

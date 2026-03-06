@@ -1,0 +1,35 @@
+# 가상환경/캐시
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+*.gguf
+
+# 학습/라벨링 데이터 제외
+classifier/data/full_shot/
+classifier/data/yolo_manual/images/
+classifier/data/yolo_manual/labelme_json/
+classifier/data/yolo_manual/labels/
+classifier/data/yolo_manual/vis/
+
+# 캐시 파일 제외
+*.cache
+
+# 배포에 불필요한 모델/변환본 제외
+classifier/models/
+!classifier/models/.gitkeep
+
+# 아카이브/디버그/테스트 제외
+classifier/scripts/_archive/
+classifier/scripts/debug_infer_draw.py
+classifier/scripts/export_tflite.py
+llm/qwen_engine.py
+llm/test_qwen.py
+llm/debug_llm.py
+tools/
+
+# 혹시 변환 산출물 제외
+*.onnx
+*.tflite
+*.pb
