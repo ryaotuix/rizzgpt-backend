@@ -8,7 +8,6 @@
 # - easyocr 버전에 따라 batched가 없을 수 있으므로 안전 fallback
 
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
