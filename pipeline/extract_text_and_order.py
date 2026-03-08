@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Tuple, Optional
 from PIL import Image
 
 # ✅ OCRLine은 ensemble 쪽 정의를 단일 소스로 사용
-from pipeline.ocr_ensemble import OCRLine, OCREnsemble
-from pipeline.rec_only import rec_batch
+from backend.pipeline.ocr_ensemble import OCRLine, OCREnsemble
+from backend.pipeline.rec_only import rec_batch
 
 
 # ------------------------------------------------------------
